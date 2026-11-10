@@ -20,6 +20,8 @@
 #include "4C_utils_singleton_owner.hpp"
 
 #include <Kokkos_Core.hpp>
+#include <Teuchos_StackedTimer.hpp>
+#include <Teuchos_TimeMonitor.hpp>
 #include <unistd.h>
 
 #include <filesystem>
@@ -206,6 +208,13 @@ int main(int argc, char* argv[])
 
 void run(CommandlineArguments& cli_args, Core::Communication::Communicators& communicators)
 {
+  auto stacked_timer = Teuchos::rcp(new Teuchos::StackedTimer("4C total"));
+  Teuchos::TimeMonitor::setStackedTimer(stacked_timer);
+  struct ResetStackedTimer
+  {
+    ~ResetStackedTimer() { Teuchos::TimeMonitor::setStackedTimer(Teuchos::null); }
+  } reset_stacked_timer;
+
   update_io_identifiers(cli_args, communicators.group_id());
 
   /* input phase, input of all information */
@@ -237,6 +246,7 @@ void run(CommandlineArguments& cli_args, Core::Communication::Communicators& com
     entrypoint_switch();
   }
 
+  stacked_timer->stopBaseTimer();
   write_timemonitor(communicators.local_comm());
 
   if (Global::Problem::instance()->io_params().get<bool>("WRITE_TIMINGS"))

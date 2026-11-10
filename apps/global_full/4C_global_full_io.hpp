@@ -62,7 +62,7 @@ void setup_global_problem(Core::IO::InputFile& input_file, const CommandlineArgu
     const Core::Communication::Communicators& communicators);
 
 /**
- * \brief Writes the Teuchos::TimeMonitor information to std::cout
+ * \brief Writes the hierarchical StackedTimer and flat TimeMonitor information to std::cout
  */
 void write_timemonitor(MPI_Comm comm);
 

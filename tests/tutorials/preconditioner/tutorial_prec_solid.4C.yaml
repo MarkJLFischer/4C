@@ -77,7 +77,7 @@ DESIGN SURF DIRICH CONDITIONS:
     VAL: [0.01, 0.01, 0.01]
     FUNCT: [null, null, null]
 STRUCTURE GEOMETRY:
-  FILE: "tutorial_prec_solid_3e5.exo"
+  FILE: "tutorial_prec_solid_6e5.exo"
   ELEMENT_BLOCKS:
     - ID: 1
       SOLID:

@@ -16,6 +16,8 @@
 #include "4C_utils_exceptions.hpp"
 
 #include <Teuchos_oblackholestream.hpp>
+#include <Teuchos_RCPStdSharedPtrConversions.hpp>
+#include <Teuchos_StackedTimer.hpp>
 #include <Teuchos_StandardParameterEntryValidators.hpp>
 #include <Teuchos_TimeMonitor.hpp>
 
@@ -112,6 +114,17 @@ void write_timemonitor(const MPI_Comm comm)
 {
   std::shared_ptr<const Teuchos::Comm<int>> TeuchosComm =
       Core::Communication::to_teuchos_comm<int>(comm);
+
+  const auto stacked_timer = Teuchos::TimeMonitor::getStackedTimer();
+  if (!stacked_timer.is_null() && !Teuchos::TimeMonitor::stackedTimerNameIsDefault())
+  {
+    Teuchos::StackedTimer::OutputOptions options;
+    options.output_fraction = true;
+    options.output_minmax = true;
+    options.align_columns = true;
+    stacked_timer->report(std::cout, Teuchos::rcp(TeuchosComm), options);
+  }
+
   Teuchos::TimeMonitor::summarize(Teuchos::Ptr(TeuchosComm.get()), std::cout, false, true, false);
 }
 
