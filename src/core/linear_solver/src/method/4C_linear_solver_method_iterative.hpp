@@ -30,6 +30,8 @@ namespace Core::LinearSolver
     //! Constructor
     IterativeSolver(MPI_Comm comm, Teuchos::ParameterList& params);
 
+    ~IterativeSolver() override;
+
     /*! \brief Forget the preconditioner and the system, so that the next setup() computes a new
      * preconditioner
      */
@@ -57,6 +59,14 @@ namespace Core::LinearSolver
     Teuchos::ParameterList& params() const { return params_; }
 
    private:
+    struct TpetraSolverData;
+
+    [[nodiscard]] bool uses_tpetra_backend() const;
+
+    void setup_tpetra();
+
+    int solve_tpetra(Core::LinAlg::MultiVector<double>& x);
+
     /*! \brief Check whether preconditioner will be reused
      *
      * The user can control reuse/recomputation of the preconditioner by setting the input argument
@@ -101,6 +111,8 @@ namespace Core::LinearSolver
 
     //! preconditioner object
     std::shared_ptr<Core::LinearSolver::PreconditionerTypeBase> preconditioner_;
+
+    std::unique_ptr<TpetraSolverData> tpetra_data_;
 
     /*! \brief Map of active DOFs in structural contact simulations.
      *

@@ -254,6 +254,7 @@ Teuchos::ParameterList translate_four_c_to_belos(const Teuchos::ParameterList& i
 {
   Teuchos::ParameterList outparams;
   outparams.set<Core::LinearSolver::SolverType>("solver", Core::LinearSolver::SolverType::Belos);
+  outparams.set("backend", inparams.get<std::string>("BACKEND"));
   Teuchos::ParameterList& beloslist = outparams.sublist("Belos Parameters");
 
   beloslist.set("reuse", inparams.get<int>("AZREUSE"));

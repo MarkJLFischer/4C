@@ -10,7 +10,20 @@ STRUCTURAL DYNAMIC:
   RESULTSEVERY: 0
   RESTARTEVERY: 0
   NORMCOMBI_RESFDISP: "Or"
-  LINEAR_SOLVER: 1
+  LINEAR_SOLVER: 6
+
+IO:
+  STRUCT_STRESS: Cauchy
+  STRUCT_STRAIN: GL
+
+IO/RUNTIME VTK OUTPUT:
+  INTERVAL_STEPS: 1
+  OUTPUT_DATA_FORMAT: binary
+
+IO/RUNTIME VTK OUTPUT/STRUCTURE:
+  OUTPUT_STRUCTURE: true
+  DISPLACEMENT: true
+  STRESS_STRAIN: true
 
 SOLVER 1:
   SOLVER: "UMFPACK"
@@ -36,6 +49,13 @@ SOLVER 5:
   SOLVER_XML_FILE: "tutorial_prec_solid_gmres.xml"
   AZPREC: "MueLu"
   PRECONDITIONER_XML_FILE: "tutorial_prec_solid_muelu_sa_amg.xml"
+SOLVER 6:
+  NAME: "Tpetra GMRES with structured geometric AMG and StructuredRAPFactory"
+  SOLVER: "Belos"
+  BACKEND: "Tpetra"
+  SOLVER_XML_FILE: "tutorial_prec_solid_gmres.xml"
+  AZPREC: "MueLu"
+  PRECONDITIONER_XML_FILE: "tutorial_prec_solid_muelu_structured.xml"
 
 MATERIALS:
   - MAT: 1
@@ -57,7 +77,7 @@ DESIGN SURF DIRICH CONDITIONS:
     VAL: [0.01, 0.01, 0.01]
     FUNCT: [null, null, null]
 STRUCTURE GEOMETRY:
-  FILE: "tutorial_prec_solid_1.exo"
+  FILE: "tutorial_prec_solid_3e5.exo"
   ELEMENT_BLOCKS:
     - ID: 1
       SOLID:

@@ -25,6 +25,12 @@ namespace Core::LinearSolver
         parameter<Core::LinearSolver::SolverType>("SOLVER",
             {.description = "Linear solver used to solve the system of linear equations."}),
 
+        parameter<std::string>("BACKEND",
+            {.description = "Linear algebra backend used by Belos and MueLu. The Tpetra backend "
+                            "currently supports serial, single-block sparse systems and performs "
+                            "a structured lexicographic permutation before the solve.",
+                .default_value = "Epetra"}),
+
         // Iterative solver options
         deprecated_selection<Core::LinearSolver::IterativeSolverType>("AZSOLVE",
             {
