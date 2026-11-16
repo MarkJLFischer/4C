@@ -11,6 +11,7 @@
 #include "4C_fem_discretization.hpp"
 #include "4C_fem_discretization_nullspace.hpp"
 #include "4C_fem_discretization_utils.hpp"
+#include "4C_fem_general_cell_type.hpp"
 #include "4C_fem_general_elementtype.hpp"
 #include "4C_fem_general_node.hpp"
 #include "4C_linalg_transfer.hpp"
@@ -18,6 +19,7 @@
 
 #include <Xpetra_EpetraIntMultiVector.hpp>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -97,6 +99,57 @@ void Core::LinearSolver::Parameters::compute_solver_parameters(
       coordinates = extract_retained_node_coordinates(dis, *nullspace_node_map);
 
     solverlist.set<std::shared_ptr<Core::LinAlg::MultiVector<double>>>("Coordinates", coordinates);
+  }
+
+  // Preserve the element topology for structured solvers. Unlike physical coordinates, this
+  // remains a tensor-product description when a structured mesh is curved or otherwise warped.
+  {
+    if (dis.num_my_row_elements() > 0 &&
+        dis.l_row_element(0)->shape() == Core::FE::CellType::hex8)
+    {
+      auto connectivity = std::make_shared<Core::LinearSolver::Hex8Connectivity>();
+      connectivity->reserve(dis.num_my_row_elements());
+      for (int element_lid = 0; element_lid < dis.num_my_row_elements(); ++element_lid)
+      {
+        const auto* element = dis.l_row_element(element_lid);
+        if (element->shape() != Core::FE::CellType::hex8)
+        {
+          connectivity->clear();
+          break;
+        }
+        FOUR_C_ASSERT_ALWAYS(element->num_node() == 8,
+            "A HEX8 element unexpectedly contains {} nodes.", element->num_node());
+        std::array<int, 8> node_ids{};
+        std::copy_n(element->node_ids(), node_ids.size(), node_ids.begin());
+        connectivity->push_back(node_ids);
+      }
+      if (!connectivity->empty())
+        solverlist.set<std::shared_ptr<Core::LinearSolver::Hex8Connectivity>>(
+            "HEX8 connectivity", connectivity);
+    }
+    else if (dis.num_my_row_elements() > 0 &&
+             dis.l_row_element(0)->shape() == Core::FE::CellType::hex27)
+    {
+      auto connectivity = std::make_shared<Core::LinearSolver::Hex27Connectivity>();
+      connectivity->reserve(dis.num_my_row_elements());
+      for (int element_lid = 0; element_lid < dis.num_my_row_elements(); ++element_lid)
+      {
+        const auto* element = dis.l_row_element(element_lid);
+        if (element->shape() != Core::FE::CellType::hex27)
+        {
+          connectivity->clear();
+          break;
+        }
+        FOUR_C_ASSERT_ALWAYS(element->num_node() == 27,
+            "A HEX27 element unexpectedly contains {} nodes.", element->num_node());
+        std::array<int, 27> node_ids{};
+        std::copy_n(element->node_ids(), node_ids.size(), node_ids.begin());
+        connectivity->push_back(node_ids);
+      }
+      if (!connectivity->empty())
+        solverlist.set<std::shared_ptr<Core::LinearSolver::Hex27Connectivity>>(
+            "HEX27 connectivity", connectivity);
+    }
   }
 
   // set nullspace information

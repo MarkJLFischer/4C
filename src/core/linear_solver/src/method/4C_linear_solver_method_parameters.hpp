@@ -16,6 +16,9 @@
 #include <Teuchos_ParameterListAcceptor.hpp>
 #include <Xpetra_MultiVector.hpp>
 
+#include <array>
+#include <vector>
+
 FOUR_C_NAMESPACE_OPEN
 
 namespace Core::FE
@@ -25,6 +28,9 @@ namespace Core::FE
 
 namespace Core::LinearSolver
 {
+  using Hex8Connectivity = std::vector<std::array<int, 8>>;
+  using Hex27Connectivity = std::vector<std::array<int, 27>>;
+
   class Parameters
   {
    public:

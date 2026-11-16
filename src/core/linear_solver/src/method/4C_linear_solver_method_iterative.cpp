@@ -8,6 +8,7 @@
 #include "4C_linear_solver_method_iterative.hpp"
 
 #include "4C_comm_utils.hpp"
+#include "4C_fem_general_utils_local_connectivity_matrices.hpp"
 #include "4C_linalg_map.hpp"
 #include "4C_linalg_sparsematrix.hpp"
 #include "4C_linear_solver_amgnxn_preconditioner.hpp"
@@ -44,8 +45,11 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <functional>
 #include <limits>
+#include <map>
 #include <numeric>
+#include <queue>
 #include <unordered_map>
 
 FOUR_C_NAMESPACE_OPEN
@@ -124,70 +128,365 @@ namespace
         "The Tpetra structured backend requires 'Array<LO> lNodesPerDim' in MueLu user data.");
   }
 
+  using Int3 = std::array<int, 3>;
+  using Orientation = std::array<int, 3>;
+
+  Int3 add(const Int3& left, const Int3& right)
+  {
+    return {left[0] + right[0], left[1] + right[1], left[2] + right[2]};
+  }
+
+  Int3 subtract(const Int3& left, const Int3& right)
+  {
+    return {left[0] - right[0], left[1] - right[1], left[2] - right[2]};
+  }
+
+  Int3 scale(const Int3& value, const int factor)
+  {
+    return {factor * value[0], factor * value[1], factor * value[2]};
+  }
+
+  Int3 orient(const Orientation& orientation, const Int3& local)
+  {
+    Int3 global{};
+    for (int local_axis = 0; local_axis < 3; ++local_axis)
+    {
+      const int encoded_axis = orientation[local_axis];
+      const int global_axis = std::abs(encoded_axis) - 1;
+      global[global_axis] = encoded_axis > 0 ? local[local_axis] : -local[local_axis];
+    }
+    return global;
+  }
+
+  std::vector<Orientation> proper_cube_orientations()
+  {
+    std::vector<Orientation> orientations;
+    std::array<int, 3> axes{0, 1, 2};
+    do
+    {
+      const int inversions = (axes[0] > axes[1]) + (axes[0] > axes[2]) +
+                             (axes[1] > axes[2]);
+      const int permutation_sign = inversions % 2 == 0 ? 1 : -1;
+      for (const int sx : {-1, 1})
+        for (const int sy : {-1, 1})
+          for (const int sz : {-1, 1})
+            if (permutation_sign * sx * sy * sz == 1)
+              orientations.push_back(
+                  {sx * (axes[0] + 1), sy * (axes[1] + 1), sz * (axes[2] + 1)});
+    } while (std::next_permutation(axes.begin(), axes.end()));
+    return orientations;
+  }
+
+  Int3 hexahedron_reference_node(const int local_node)
+  {
+    Int3 result{};
+    for (int axis = 0; axis < 3; ++axis)
+      result[axis] = static_cast<int>(
+          Core::FE::eleNodeNumbering_hex27_nodes_reference[local_node][axis]);
+    return result;
+  }
+
+  template <std::size_t nodes_per_element>
+  std::vector<int> build_node_order_from_hex_connectivity(
+      const std::vector<std::array<int, nodes_per_element>>& connectivity,
+      const Teuchos::Array<int>& local_nodes_per_dimension, const Epetra_BlockMap& coordinate_map)
+  {
+    static_assert(nodes_per_element == 8 || nodes_per_element == 27);
+    constexpr bool is_quadratic = nodes_per_element == 27;
+    constexpr int nodes_per_face = is_quadratic ? 9 : 4;
+    constexpr int element_stride = is_quadratic ? 2 : 1;
+    constexpr const char* element_name = is_quadratic ? "HEX27" : "HEX8";
+    FOUR_C_ASSERT_ALWAYS(local_nodes_per_dimension.size() == 3,
+        "{} topology reconstruction requires exactly three entries in lNodesPerDim.",
+        element_name);
+
+    Int3 element_dimensions{};
+    long long expected_elements = 1;
+    for (int axis = 0; axis < 3; ++axis)
+    {
+      FOUR_C_ASSERT_ALWAYS(local_nodes_per_dimension[axis] >= element_stride + 1 &&
+                               (local_nodes_per_dimension[axis] - 1) % element_stride == 0,
+          "{} lNodesPerDim entry {} is incompatible with the element order.", element_name,
+          local_nodes_per_dimension[axis]);
+      element_dimensions[axis] = (local_nodes_per_dimension[axis] - 1) / element_stride;
+      expected_elements *= element_dimensions[axis];
+    }
+    FOUR_C_ASSERT_ALWAYS(expected_elements == static_cast<long long>(connectivity.size()),
+        "lNodesPerDim describes {} {} elements, but the discretization contains {}.",
+        expected_elements, element_name, connectivity.size());
+
+    struct FaceOccurrence
+    {
+      int element;
+      int face;
+    };
+    using FaceKey = std::vector<int>;
+    std::map<FaceKey, std::vector<FaceOccurrence>> face_occurrences;
+    for (int element = 0; element < static_cast<int>(connectivity.size()); ++element)
+      for (int face = 0; face < 6; ++face)
+      {
+        FaceKey key(nodes_per_face);
+        for (int face_node = 0; face_node < nodes_per_face; ++face_node)
+          key[face_node] = connectivity[element]
+              [Core::FE::eleNodeNumbering_hex27_surfaces[face][face_node]];
+        std::sort(key.begin(), key.end());
+        face_occurrences[key].push_back({element, face});
+      }
+
+    std::vector<std::array<FaceOccurrence, 6>> neighbors(connectivity.size());
+    for (auto& element_neighbors : neighbors)
+      element_neighbors.fill({-1, -1});
+    for (const auto& [face, occurrences] : face_occurrences)
+    {
+      (void)face;
+      FOUR_C_ASSERT_ALWAYS(occurrences.size() <= 2,
+          "More than two {} elements share the same face.", element_name);
+      if (occurrences.size() == 2)
+      {
+        neighbors[occurrences[0].element][occurrences[0].face] = occurrences[1];
+        neighbors[occurrences[1].element][occurrences[1].face] = occurrences[0];
+      }
+    }
+
+    // Face normals in the canonical hexahedral reference coordinate system.
+    constexpr std::array<Int3, 6> face_directions{
+        Int3{0, 0, -1}, Int3{0, -1, 0}, Int3{1, 0, 0},
+        Int3{0, 1, 0}, Int3{-1, 0, 0}, Int3{0, 0, 1}};
+    const auto orientations = proper_cube_orientations();
+    std::vector<Orientation> element_orientations(connectivity.size());
+    std::vector<Int3> element_positions(connectivity.size());
+    std::vector<bool> visited(connectivity.size(), false);
+    std::queue<int> pending;
+    element_orientations[0] = {1, 2, 3};
+    element_positions[0] = {0, 0, 0};
+    visited[0] = true;
+    pending.push(0);
+
+    while (!pending.empty())
+    {
+      const int element = pending.front();
+      pending.pop();
+      for (int face = 0; face < 6; ++face)
+      {
+        const auto neighbor = neighbors[element][face];
+        if (neighbor.element < 0) continue;
+
+        const Int3 direction = orient(element_orientations[element], face_directions[face]);
+        const Int3 neighbor_position = add(element_positions[element], direction);
+        std::vector<Orientation> matches;
+        for (const auto& candidate : orientations)
+        {
+          if (orient(candidate, face_directions[neighbor.face]) != scale(direction, -1)) continue;
+          bool matches_shared_nodes = true;
+          for (int face_node = 0; face_node < nodes_per_face && matches_shared_nodes; ++face_node)
+          {
+            const int local_node =
+                Core::FE::eleNodeNumbering_hex27_surfaces[face][face_node];
+            const int node_gid = connectivity[element][local_node];
+            const auto neighbor_node = std::find_if(
+                Core::FE::eleNodeNumbering_hex27_surfaces[neighbor.face],
+                Core::FE::eleNodeNumbering_hex27_surfaces[neighbor.face] + nodes_per_face,
+                [&](const int candidate_node) {
+                  return connectivity[neighbor.element][candidate_node] == node_gid;
+                });
+            FOUR_C_ASSERT_ALWAYS(neighbor_node !=
+                                     Core::FE::eleNodeNumbering_hex27_surfaces[neighbor.face] +
+                                         nodes_per_face,
+                "Matched {} faces do not contain identical node IDs.", element_name);
+            const Int3 current_reference =
+                orient(element_orientations[element], hexahedron_reference_node(local_node));
+            const Int3 neighbor_reference =
+                orient(candidate, hexahedron_reference_node(*neighbor_node));
+            matches_shared_nodes =
+                neighbor_reference == subtract(current_reference, scale(direction, 2));
+          }
+          if (matches_shared_nodes) matches.push_back(candidate);
+        }
+        FOUR_C_ASSERT_ALWAYS(matches.size() == 1,
+            "Could not determine a unique relative orientation for adjacent {} elements.",
+            element_name);
+
+        if (!visited[neighbor.element])
+        {
+          visited[neighbor.element] = true;
+          element_positions[neighbor.element] = neighbor_position;
+          element_orientations[neighbor.element] = matches.front();
+          pending.push(neighbor.element);
+        }
+        else
+        {
+          FOUR_C_ASSERT_ALWAYS(element_positions[neighbor.element] == neighbor_position &&
+                                   element_orientations[neighbor.element] == matches.front(),
+              "The {} connectivity is not a consistent structured lattice.", element_name);
+        }
+      }
+    }
+    FOUR_C_ASSERT_ALWAYS(std::all_of(visited.begin(), visited.end(), [](const bool value) {
+                           return value;
+                         }),
+        "The {} element graph is disconnected.", element_name);
+
+    Int3 minimum_element = element_positions.front();
+    Int3 maximum_element = element_positions.front();
+    for (const auto& position : element_positions)
+      for (int axis = 0; axis < 3; ++axis)
+      {
+        minimum_element[axis] = std::min(minimum_element[axis], position[axis]);
+        maximum_element[axis] = std::max(maximum_element[axis], position[axis]);
+      }
+
+    Int3 traversal_node_dimensions{};
+    for (int axis = 0; axis < 3; ++axis)
+      traversal_node_dimensions[axis] =
+          element_stride * (maximum_element[axis] - minimum_element[axis] + 1) + 1;
+    std::array<int, 3> traversal_axis_for_logical_axis{-1, -1, -1};
+    std::array<bool, 3> traversal_axis_used{false, false, false};
+    for (int logical_axis = 0; logical_axis < 3; ++logical_axis)
+      for (int traversal_axis = 0; traversal_axis < 3; ++traversal_axis)
+        if (!traversal_axis_used[traversal_axis] &&
+            traversal_node_dimensions[traversal_axis] ==
+                local_nodes_per_dimension[logical_axis])
+        {
+          traversal_axis_for_logical_axis[logical_axis] = traversal_axis;
+          traversal_axis_used[traversal_axis] = true;
+          break;
+        }
+    FOUR_C_ASSERT_ALWAYS(std::none_of(traversal_axis_for_logical_axis.begin(),
+                             traversal_axis_for_logical_axis.end(),
+                             [](const int axis) { return axis < 0; }),
+        "The {} connectivity dimensions do not match lNodesPerDim.", element_name);
+
+    std::unordered_map<int, Int3> traversal_index_for_node;
+    traversal_index_for_node.reserve(coordinate_map.NumMyElements());
+    for (int element = 0; element < static_cast<int>(connectivity.size()); ++element)
+      for (int local_node = 0; local_node < static_cast<int>(nodes_per_element); ++local_node)
+      {
+        Int3 oriented_reference =
+            orient(element_orientations[element], hexahedron_reference_node(local_node));
+        if (!is_quadratic)
+          for (int axis = 0; axis < 3; ++axis)
+            oriented_reference[axis] = (oriented_reference[axis] + 1) / 2;
+        Int3 index = add(scale(subtract(element_positions[element], minimum_element),
+                             element_stride),
+            oriented_reference);
+        if (is_quadratic)
+          for (int axis = 0; axis < 3; ++axis) ++index[axis];
+        const int node_gid = connectivity[element][local_node];
+        const auto [entry, inserted] = traversal_index_for_node.emplace(node_gid, index);
+        FOUR_C_ASSERT_ALWAYS(inserted || entry->second == index,
+            "Adjacent {} elements assign inconsistent logical indices to node {}.", element_name,
+            node_gid);
+      }
+    FOUR_C_ASSERT_ALWAYS(
+        traversal_index_for_node.size() == static_cast<std::size_t>(coordinate_map.NumMyElements()),
+        "{} connectivity contains {} nodes, but the coordinate map contains {}.", element_name,
+        traversal_index_for_node.size(), coordinate_map.NumMyElements());
+
+    std::vector<int> old_node_gid_for_new_node_gid(coordinate_map.NumMyElements(), -1);
+    for (const auto& [old_node_gid, traversal_index] : traversal_index_for_node)
+    {
+      Int3 logical_index{};
+      for (int logical_axis = 0; logical_axis < 3; ++logical_axis)
+        logical_index[logical_axis] =
+            traversal_index[traversal_axis_for_logical_axis[logical_axis]];
+      const int new_node_gid = logical_index[0] + local_nodes_per_dimension[0] *
+                                                      (logical_index[1] +
+                                                          local_nodes_per_dimension[1] *
+                                                              logical_index[2]);
+      FOUR_C_ASSERT_ALWAYS(new_node_gid >= 0 &&
+                               new_node_gid < static_cast<int>(old_node_gid_for_new_node_gid.size()),
+          "{} node {} maps outside the structured grid.", element_name, old_node_gid);
+      FOUR_C_ASSERT_ALWAYS(old_node_gid_for_new_node_gid[new_node_gid] == -1,
+          "Two {} nodes map to structured node {}.", element_name, new_node_gid);
+      old_node_gid_for_new_node_gid[new_node_gid] = old_node_gid;
+    }
+    FOUR_C_ASSERT_ALWAYS(std::none_of(old_node_gid_for_new_node_gid.begin(),
+                             old_node_gid_for_new_node_gid.end(),
+                             [](const int gid) { return gid < 0; }),
+        "The {} structured node permutation is incomplete.", element_name);
+    return old_node_gid_for_new_node_gid;
+  }
+
   StructuredPermutation build_structured_permutation(const Epetra_CrsMatrix& matrix,
       const Epetra_MultiVector& coordinates, const int dofs_per_node,
-      const Teuchos::Array<int>& local_nodes_per_dimension)
+      const Teuchos::Array<int>& local_nodes_per_dimension,
+      const Core::LinearSolver::Hex8Connectivity* hex8_connectivity,
+      const Core::LinearSolver::Hex27Connectivity* hex27_connectivity)
   {
-    FOUR_C_ASSERT_ALWAYS(local_nodes_per_dimension.size() == 3,
-        "The current Tpetra structured backend requires exactly three local mesh dimensions.");
+    FOUR_C_ASSERT_ALWAYS(
+        local_nodes_per_dimension.size() >= 1 &&
+            local_nodes_per_dimension.size() <= coordinates.NumVectors(),
+        "lNodesPerDim contains {} dimensions, but the coordinate vector has {} components.",
+        local_nodes_per_dimension.size(), coordinates.NumVectors());
     FOUR_C_ASSERT_ALWAYS(dofs_per_node > 0, "The number of degrees of freedom per node is invalid.");
     FOUR_C_ASSERT_ALWAYS(matrix.NumMyRows() == coordinates.MyLength() * dofs_per_node,
         "The matrix has {} local rows, but the coordinate map and block size describe {} rows.",
         matrix.NumMyRows(), coordinates.MyLength() * dofs_per_node);
 
-    const long long expected_nodes = static_cast<long long>(local_nodes_per_dimension[0]) *
-                                     local_nodes_per_dimension[1] * local_nodes_per_dimension[2];
+    const long long expected_nodes = std::accumulate(local_nodes_per_dimension.begin(),
+        local_nodes_per_dimension.end(), 1LL, std::multiplies<>());
     FOUR_C_ASSERT_ALWAYS(expected_nodes == coordinates.MyLength(),
         "lNodesPerDim describes {} nodes, but the coordinate vector contains {} nodes.",
         expected_nodes, coordinates.MyLength());
 
-    std::array<std::vector<double>, 3> axis_values;
-    for (int axis = 0; axis < 3; ++axis)
-      axis_values[axis] = unique_sorted_coordinates(coordinates, axis);
-
-    // Match logical structured dimensions to physical coordinate axes. This supports the tutorial
-    // convention {56,12,12}, where logical x is the beam's physical z direction.
-    std::array<int, 3> physical_axis_for_logical_axis{-1, -1, -1};
-    std::array<bool, 3> physical_axis_used{false, false, false};
-    for (int logical_axis = 0; logical_axis < 3; ++logical_axis)
-      for (int physical_axis = 0; physical_axis < 3; ++physical_axis)
-        if (!physical_axis_used[physical_axis] &&
-            static_cast<int>(axis_values[physical_axis].size()) ==
-                local_nodes_per_dimension[logical_axis])
-        {
-          physical_axis_for_logical_axis[logical_axis] = physical_axis;
-          physical_axis_used[physical_axis] = true;
-          break;
-        }
-
-    FOUR_C_ASSERT_ALWAYS(std::none_of(physical_axis_for_logical_axis.begin(),
-                             physical_axis_for_logical_axis.end(), [](const int axis) { return axis < 0; }),
-        "Could not match lNodesPerDim {{{}, {}, {}}} to the coordinate-grid dimensions "
-        "{{{}, {}, {}}}.",
-        local_nodes_per_dimension[0], local_nodes_per_dimension[1],
-        local_nodes_per_dimension[2], axis_values[0].size(), axis_values[1].size(),
-        axis_values[2].size());
-
     StructuredPermutation permutation;
     permutation.local_nodes_per_dimension = local_nodes_per_dimension;
-    permutation.old_node_gid_for_new_node_gid.assign(coordinates.MyLength(), -1);
-
-    for (int old_node_lid = 0; old_node_lid < coordinates.MyLength(); ++old_node_lid)
+    FOUR_C_ASSERT_ALWAYS(hex8_connectivity == nullptr || hex27_connectivity == nullptr,
+        "Both HEX8 and HEX27 connectivity were supplied for one structured system.");
+    if (hex8_connectivity != nullptr)
     {
-      std::array<int, 3> logical_index{};
-      for (int logical_axis = 0; logical_axis < 3; ++logical_axis)
+      permutation.old_node_gid_for_new_node_gid = build_node_order_from_hex_connectivity(
+          *hex8_connectivity, local_nodes_per_dimension, coordinates.Map());
+    }
+    else if (hex27_connectivity != nullptr)
+    {
+      permutation.old_node_gid_for_new_node_gid = build_node_order_from_hex_connectivity(
+          *hex27_connectivity, local_nodes_per_dimension, coordinates.Map());
+    }
+    else
+    {
+      std::vector<std::vector<double>> axis_values(coordinates.NumVectors());
+      for (int axis = 0; axis < coordinates.NumVectors(); ++axis)
+        axis_values[axis] = unique_sorted_coordinates(coordinates, axis);
+      std::vector<int> physical_axis_for_logical_axis(local_nodes_per_dimension.size(), -1);
+      std::vector<bool> physical_axis_used(coordinates.NumVectors(), false);
+      for (int logical_axis = 0; logical_axis < local_nodes_per_dimension.size(); ++logical_axis)
+        for (int physical_axis = 0; physical_axis < coordinates.NumVectors(); ++physical_axis)
+          if (!physical_axis_used[physical_axis] &&
+              static_cast<int>(axis_values[physical_axis].size()) ==
+                  local_nodes_per_dimension[logical_axis])
+          {
+            physical_axis_for_logical_axis[logical_axis] = physical_axis;
+            physical_axis_used[physical_axis] = true;
+            break;
+          }
+      FOUR_C_ASSERT_ALWAYS(std::none_of(physical_axis_for_logical_axis.begin(),
+                               physical_axis_for_logical_axis.end(),
+                               [](const int axis) { return axis < 0; }),
+          "Could not match lNodesPerDim to the coordinate-grid dimensions, and no supported "
+          "hexahedral connectivity is available.");
+
+      permutation.old_node_gid_for_new_node_gid.assign(coordinates.MyLength(), -1);
+      for (int old_node_lid = 0; old_node_lid < coordinates.MyLength(); ++old_node_lid)
       {
-        const int physical_axis = physical_axis_for_logical_axis[logical_axis];
-        logical_index[logical_axis] =
-            coordinate_index(axis_values[physical_axis], coordinates[physical_axis][old_node_lid]);
+        std::vector<int> logical_index(local_nodes_per_dimension.size());
+        for (int logical_axis = 0; logical_axis < local_nodes_per_dimension.size(); ++logical_axis)
+        {
+          const int physical_axis = physical_axis_for_logical_axis[logical_axis];
+          logical_index[logical_axis] = coordinate_index(
+              axis_values[physical_axis], coordinates[physical_axis][old_node_lid]);
+        }
+        int new_node_gid = logical_index.back();
+        for (int logical_axis = static_cast<int>(logical_index.size()) - 2; logical_axis >= 0;
+            --logical_axis)
+          new_node_gid =
+              logical_index[logical_axis] + local_nodes_per_dimension[logical_axis] * new_node_gid;
+        FOUR_C_ASSERT_ALWAYS(permutation.old_node_gid_for_new_node_gid[new_node_gid] == -1,
+            "Two 4C nodes map to structured node {}. The coordinate grid is not one-to-one.",
+            new_node_gid);
+        permutation.old_node_gid_for_new_node_gid[new_node_gid] =
+            coordinates.Map().GID(old_node_lid);
       }
-      const int new_node_gid = logical_index[0] + local_nodes_per_dimension[0] *
-                                                     (logical_index[1] +
-                                                         local_nodes_per_dimension[1] * logical_index[2]);
-      FOUR_C_ASSERT_ALWAYS(permutation.old_node_gid_for_new_node_gid[new_node_gid] == -1,
-          "Two 4C nodes map to structured node {}. The coordinate grid is not one-to-one.",
-          new_node_gid);
-      permutation.old_node_gid_for_new_node_gid[new_node_gid] = coordinates.Map().GID(old_node_lid);
     }
 
     const int num_dofs = matrix.NumMyRows();
@@ -507,9 +806,9 @@ void Core::LinearSolver::IterativeSolver::setup_tpetra()
   validate_coarse_solver(muelu_parameters);
 
   const int dofs_per_node = muelu_solver_parameters.get<int>("PDE equations");
-  FOUR_C_ASSERT_ALWAYS(dofs_per_node == 3,
-      "The current structured Tpetra permutation is implemented for three displacement DOFs per "
-      "node, but the solver reports {}.",
+  FOUR_C_ASSERT_ALWAYS(dofs_per_node > 0,
+      "The structured Tpetra permutation requires a positive number of DOFs per node, but the "
+      "solver reports {}.",
       dofs_per_node);
 
   if (muelu_solver_parameters.isParameter("Coordinates"))
@@ -522,6 +821,14 @@ void Core::LinearSolver::IterativeSolver::setup_tpetra()
   const auto nullspace =
       muelu_solver_parameters
           .get<std::shared_ptr<Core::LinAlg::MultiVector<double>>>("nullspace", nullptr);
+  const auto hex8_connectivity =
+      muelu_solver_parameters
+          .get<std::shared_ptr<Core::LinearSolver::Hex8Connectivity>>(
+              "HEX8 connectivity", nullptr);
+  const auto hex27_connectivity =
+      muelu_solver_parameters
+          .get<std::shared_ptr<Core::LinearSolver::Hex27Connectivity>>(
+              "HEX27 connectivity", nullptr);
   FOUR_C_ASSERT_ALWAYS(coordinates != nullptr, "MueLu coordinates are unavailable.");
   FOUR_C_ASSERT_ALWAYS(nullspace != nullptr, "MueLu nullspace is unavailable.");
 
@@ -533,7 +840,8 @@ void Core::LinearSolver::IterativeSolver::setup_tpetra()
     TEUCHOS_FUNC_TIME_MONITOR(
         "Core::LinAlg::Solver: Tpetra structured permutation construction");
     data->permutation = build_structured_permutation(epetra_matrix,
-        coordinates->get_epetra_multi_vector(), dofs_per_node, dimensions);
+        coordinates->get_epetra_multi_vector(), dofs_per_node, dimensions,
+        hex8_connectivity.get(), hex27_connectivity.get());
   }
 
   {
