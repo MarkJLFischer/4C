@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <format>
+#include <unordered_set>
 
 FOUR_C_NAMESPACE_OPEN
 
@@ -500,17 +501,15 @@ int Core::DOFSets::DofSet::assign_degrees_of_freedom(
   localcoldofs.reserve(numrownodes * maxnodenumdf + numrowelements * maxelementnumdf);
   std::vector<int> allnodelocalcoldofs;
   allnodelocalcoldofs.reserve(numrownodes * maxnodenumdf);
+  std::unordered_set<int> inserted_nodal_dofs;
+  inserted_nodal_dofs.reserve(numrownodes * maxnodenumdf);
 
-  for (std::map<int, std::vector<int>>::iterator i = nodedofset.begin(); i != nodedofset.end(); ++i)
+  for (const auto& [_, dofs] : nodedofset)
   {
-    std::vector<int>& dofs = i->second;
-    std::vector<int> cleandofs;
-    for (unsigned j = 0; j < dofs.size(); ++j)
+    for (const int dof : dofs)
     {
-      if (std::find(localcoldofs.begin(), localcoldofs.end(), dofs[j]) == localcoldofs.end())
-        cleandofs.push_back(dofs[j]);
+      if (inserted_nodal_dofs.insert(dof).second) localcoldofs.push_back(dof);
     }
-    std::copy(cleandofs.begin(), cleandofs.end(), std::back_inserter(localcoldofs));
     std::copy(dofs.begin(), dofs.end(), std::back_inserter(allnodelocalcoldofs));
   }
   for (std::map<int, std::vector<int>>::iterator i = facedofset.begin(); i != facedofset.end(); ++i)
